@@ -1,332 +1,281 @@
 #!/usr/bin/env bash
-# Matomo Upgrader — interactive & flag-driven Bash utility
-# Features: upgrade/downgrade (code only for downgrade), incremental, progress, prompts, flags.
-
+# Matomo upgrader / downgrader helper
+# Works on bash; do not run with sh.
 set -Eeuo pipefail
 
-# ----------- UI helpers -----------
-bold()  { printf '\033[1m%s\033[0m' "$*"; }
-ts()    { date '+%Y-%m-%d %H:%M:%S'; }
-die()   { printf 'ERROR [%s] %s\n' "$(ts)" "$*" >&2; exit 1; }
-info()  { printf '[%s] %s\n' "$(ts)" "$*"; }
-ok()    { printf '✓ %s\n' "$*"; }
-warn()  { printf '! %s\n' "$*"; }
-hr()    { printf -- '----------------------------------------\n'; }
-
-# ----------- defaults -----------
-MATOMO_DIR=""
-BACKUP_DIR="/var/backups/matomo-upgrades"
-MATOMO_USER="$(id -un)"
-OPERATION="upgrade"              # or downgrade
-TARGET_VERSION=""                # empty = latest
-INCREMENTAL="no"                 # yes/no
-RUN_DB_UPDATE="yes"              # yes/no
-MAINTENANCE="yes"                # yes/no
-DRY_RUN="no"                     # yes/no
-DIAG="yes"                       # yes/no
-VERBOSE="no"                     # yes/no
-ASSUME_YES="no"                  # yes/no
-
-# ----------- usage -----------
-usage() {
-cat <<'HELP'
-Matomo Upgrader
-===============
-
-Usage:
-  upgradescript [options]
-
-Options:
-  --matomo-dir PATH         Path to Matomo root (contains ./console and config/config.ini.php)
-  --backup-dir PATH         Backup folder for config (default: /var/backups/matomo-upgrades)
-  --user NAME               System user that owns/runs Matomo (default: current user)
-  --operation OP            "upgrade" (default) or "downgrade" (code-only)
-  --target VERSION          Version to move to (e.g. 5.5.1). Empty = latest build
-  --incremental yes|no      Walk majors step by step when upgrading (default: no)
-  --run-db-update yes|no    Run "console core:update" (default: yes)
-  --maintenance yes|no      Toggle maintenance and pause tracking (default: yes)
-  --dry-run yes|no          Plan only, don’t change files (default: no)
-  --diagnostics yes|no      Run "diagnostics:unexpected-files" after deploy (default: yes)
-  --verbose yes|no          Shell trace via set -x (default: no)
-  -y, --yes                 Assume "yes" to prompts
-
-Examples:
-  upgradescript --matomo-dir /var/www/matomo --backup-dir /home/me/mtm-backups -y
-  upgradescript --matomo-dir ~/matomo --operation downgrade --target 5.4.0
-
-Notes:
-- Downgrade is code-only. Matomo doesn't support automatic DB schema downgrades.
-- If you use a root-owned backup dir, run with sudo OR choose a dir you own (recommended).
-
-HELP
-}
-
-# ----------- arg parser -----------
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --help|-h) usage; exit 0 ;;
-    --matomo-dir)       MATOMO_DIR="${2:-}"; shift 2 ;;
-    --backup-dir)       BACKUP_DIR="${2:-}"; shift 2 ;;
-    --user)             MATOMO_USER="${2:-}"; shift 2 ;;
-    --operation)        OPERATION="${2:-}"; shift 2 ;;
-    --target)           TARGET_VERSION="${2:-}"; shift 2 ;;
-    --incremental)      INCREMENTAL="${2:-}"; shift 2 ;;
-    --run-db-update)    RUN_DB_UPDATE="${2:-}"; shift 2 ;;
-    --maintenance)      MAINTENANCE="${2:-}"; shift 2 ;;
-    --dry-run)          DRY_RUN="${2:-}"; shift 2 ;;
-    --diagnostics)      DIAG="${2:-}"; shift 2 ;;
-    --verbose)          VERBOSE="${2:-}"; shift 2 ;;
-    --yes|-y)           ASSUME_YES="yes"; shift ;;
-    *) die "Unknown option: $1  (use --help)";;
-  esac
-done
-
-[[ "${VERBOSE}" == "yes" ]] && set -x
-
-# ----------- helpers -----------
-prompt() {
-  local msg="$1" def="${2:-}"
-  local ans
-  if [[ "${ASSUME_YES}" == "yes" && -n "${def}" ]]; then
-    printf '%s %s\n' "$msg" "$def"
-    echo "${def}"
+# -------- utilities --------
+say() { printf '[%(%Y-%m-%d %H:%M:%S)T] %s\n' -1 "$*"; }
+step() { printf '[%(%Y-%m-%d %H:%M:%S)T] [STEP %s] %s\n' -1 "$1" "$2"; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+run() {
+  local desc="$1"; shift
+  step "$CURRENT_STEP/$TOTAL_STEPS" "$desc"
+  if [[ "${DRY_RUN}" == "yes" ]]; then
+    printf '→ DRY RUN: %q ' "$@"; printf '\n'
     return 0
   fi
-  read -r -p "$msg " ans || true
-  if [[ -z "${ans}" && -n "${def}" ]]; then
-    echo "${def}"
-  else
-    echo "${ans}"
+  "$@"
+}
+
+trim() { awk '{$1=$1;print}' <<<"$1"; }
+
+# -------- detection & prompts --------
+is_matomo_dir() { [[ -x "$1/console" && -f "$1/config/config.ini.php" ]]; }
+
+detect_matomo_dir() {
+  if is_matomo_dir "."; then pwd; return 0; fi
+  if is_matomo_dir "/var/www/html/matomo"; then echo "/var/www/html/matomo"; return 0; fi
+  # try parent paths up to 3 levels
+  local d
+  for d in ".." "../.." "../../.."; do
+    if is_matomo_dir "$d"; then (cd "$d" && pwd); return 0; fi
+  done
+  echo ""
+}
+
+prompt_matomo_dir() {
+  local detected; detected="$(detect_matomo_dir || true)"
+  if [[ -n "$detected" ]]; then
+    echo "Detected Matomo at: $detected"
+    read -r -p "Use this path? [Y/n]: " ans
+    ans="${ans:-Y}"
+    if [[ "$ans" =~ ^[Yy]$ ]]; then MATOMO_DIR="$detected"; fi
   fi
+
+  while :; do
+    if [[ -z "${MATOMO_DIR:-}" ]]; then
+      read -r -p "Enter Matomo directory (must contain ./console and config/config.ini.php): " MATOMO_DIR
+    fi
+    MATOMO_DIR="$(trim "${MATOMO_DIR:-}")"
+    MATOMO_DIR="${MATOMO_DIR%/}"
+    if [[ -z "$MATOMO_DIR" ]]; then echo "Path cannot be empty."; MATOMO_DIR=""; continue; fi
+    if [[ ! -d "$MATOMO_DIR" ]]; then echo "Directory not found: $MATOMO_DIR"; MATOMO_DIR=""; continue; fi
+    if ! is_matomo_dir "$MATOMO_DIR"; then echo "This does not look like a Matomo install: $MATOMO_DIR"; MATOMO_DIR=""; continue; fi
+    break
+  done
+  echo "Using MATOMO_DIR: $MATOMO_DIR"
 }
 
-confirm() {
-  local msg="$1"
-  if [[ "${ASSUME_YES}" == "yes" ]]; then
-    return 0
-  fi
-  read -r -p "$msg [y/N]: " r || true
-  [[ "${r,,}" == "y" || "${r,,}" == "yes" ]]
-}
-
-is_matomo_dir() {
-  [[ -x "${1}/console" && -f "${1}/config/config.ini.php" ]]
-}
-
+# -------- version helpers --------
 current_version() {
-  # Parse from core/Version.php or vendor/composer/installed.php
-  local ver=""
-  if [[ -f "${MATOMO_DIR}/core/Version.php" ]]; then
-    ver="$(grep -Eo "const VERSION = '([0-9]+\.[0-9]+\.[0-9]+)';" "${MATOMO_DIR}/core/Version.php" \
-           | grep -Eo "[0-9]+\.[0-9]+\.[0-9]+")" || true
-  fi
-  if [[ -z "${ver}" && -f "${MATOMO_DIR}/vendor/composer/installed.php" ]]; then
-    ver="$(grep -Eo "'matomo/matomo'.*'pretty_version' => '([^']+)'" "${MATOMO_DIR}/vendor/composer/installed.php" \
-           | grep -Eo "[0-9]+\.[0-9]+\.[0-9]+")" || true
-  fi
-  echo "${ver}"
-}
-
-remote_latest() {
-  # builds lists a "LATEST" file; fall back to version list if needed
-  local latest
-  if latest="$(curl -fsSL https://builds.matomo.org/LATEST 2>/dev/null)"; then
-    echo "${latest}"
-  else
-    curl -fsSL https://builds.matomo.org/ \
-      | grep -Eo 'matomo-[0-9]+\.[0-9]+\.[0-9]+\.zip' \
-      | sed -E 's/^matomo-([0-9]+\.[0-9]+\.[0-9]+)\.zip/\1/' \
-      | sort -V | tail -n1
+  # Prefer PHP to ask Matomo, fallback to parsing Version.php
+  if [[ -x "$MATOMO_DIR/console" ]]; then
+    (cd "$MATOMO_DIR" && php -d detect_unicode=0 -d short_open_tag=0 ./console core:version 2>/dev/null | awk 'NF{print $NF;exit}') || true
   fi
 }
 
-download_build() {
-  local v="$1" out="$2"
-  local url
-  if [[ "${v}" == "latest" ]]; then
-    url="https://builds.matomo.org/matomo.zip"
-  else
-    url="https://builds.matomo.org/matomo-${v}.zip"
-  fi
-  info "Downloading Matomo build: ${v}"
-  curl -fL --progress-bar "${url}" -o "${out}" || die "Failed downloading ${url}"
-  ok "Downloaded ${v} → $(basename "${out}")"
+parse_version_major() { awk -F. '{print $1}' <<<"$1"; }
+parse_version_minor() { awk -F. '{print $2}' <<<"$1"; }
+
+latest_remote_version() {
+  # Ask builds.matomo.org for LATEST. We tolerate failure and return "latest".
+  local v
+  v="$(curl -fsS https://builds.matomo.org/LATEST 2>/dev/null || true)"
+  v="$(trim "${v:-}")"
+  if [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$v"; else echo "latest"; fi
 }
 
-enable_maintenance() {
-  info "$(bold "[STEP ${STEP}/7]") Enabling maintenance mode and pausing tracking"
-  local start=$(date +%s)
-  if [[ "${MAINTENANCE}" == "yes" && "${DRY_RUN}" == "no" ]]; then
-    php "${MATOMO_DIR}/console" config:set --section=General --key=maintenance_mode --value=1 >/dev/null
-    php "${MATOMO_DIR}/console" config:set --section=Tracker --key=record_statistics --value=0 >/dev/null
-    ok "Maintenance enabled and tracking paused"
+zip_url_for_version() {
+  local v="$1"
+  if [[ "$v" == "latest" ]]; then
+    echo "https://builds.matomo.org/matomo.zip"
   else
-    warn "Skipping (maintenance=${MAINTENANCE}, dry-run=${DRY_RUN})"
+    echo "https://builds.matomo.org/matomo-$v.zip"
   fi
-  info "Done in $(( $(date +%s) - start ))s"
 }
 
-disable_maintenance() {
-  info "$(bold "[STEP ${STEP}/7]") Disabling maintenance mode and resuming tracking"
-  local start=$(date +%s)
-  if [[ "${MAINTENANCE}" == "yes" && "${DRY_RUN}" == "no" ]]; then
-    php "${MATOMO_DIR}/console" config:set --section=General --key=maintenance_mode --value=0 >/dev/null
-    php "${MATOMO_DIR}/console" config:set --section=Tracker --key=record_statistics --value=1 >/devnull 2>&1 || true
-    ok "Maintenance disabled and tracking resumed"
-  else
-    warn "Skipping (maintenance=${MAINTENANCE}, dry-run=${DRY_RUN})"
+plan_sequence() {
+  # Given CURRENT and TARGET plus AUTO_INCREMENTAL, echo a space-separated sequence
+  local cur="$1" tgt="$2" inc="$3"
+  if [[ "$tgt" == "latest" ]]; then
+    if [[ "$inc" == "yes" && "$cur" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      # Try to hop major-by-major: LATEST_<major_of_cur>, then LATEST (best-effort)
+      local major; major="$(parse_version_major "$cur")"
+      local hop="latest"
+      # Matomo publishes LATEST_5 for v5 line. Build that name if useful.
+      if [[ "$major" =~ ^[0-9]+$ && "$major" -ge 4 ]]; then
+        # If already on 5.x this will still pull latest 5 then latest
+        echo "latest_$major latest"
+        return 0
+      fi
+      echo "latest"
+      return 0
+    else
+      echo "latest"
+      return 0
+    fi
   fi
-  info "Done in $(( $(date +%s) - start ))s"
+  echo "$tgt"
+}
+
+resolve_latest_alias() {
+  # translate latest_5 -> actual version if available; else keep alias
+  local alias="$1"
+  if [[ "$alias" =~ ^latest_([0-9]+)$ ]]; then
+    local m="${BASH_REMATCH[1]}"
+    local v
+    v="$(curl -fsS "https://builds.matomo.org/LATEST_$m" 2>/dev/null || true)"
+    v="$(trim "${v:-}")"
+    if [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "$v"; else echo "$alias"; fi
+  else
+    echo "$alias"
+  fi
+}
+
+# -------- maintenance & config --------
+set_config() {
+  local section="$1" key="$2" val="$3"
+  run "Setting [$section] $key = \"$val\"" "$MATOMO_DIR/console" config:set --section="$section" --key="$key" --value="$val" >/dev/null
+  echo "done."
+}
+
+enable_maintenance_and_pause() {
+  set_config "General" "maintenance_mode" "1"
+  set_config "Tracker" "record_statistics" "0"
+  echo "✓ Maintenance enabled and tracking paused"
+}
+
+disable_maintenance_and_resume() {
+  set_config "General" "maintenance_mode" "0"
+  set_config "Tracker" "record_statistics" "1"
+  echo "✓ Maintenance disabled and tracking resumed"
+}
+
+# -------- deploy --------
+deploy_zip_into_matomo() {
+  local version_label="$1"
+  local url="$2"
+  local tmpd; tmpd="$(mktemp -d)"
+  trap 'rm -rf "$tmpd"' RETURN
+
+  say "Downloading $version_label from: $url"
+  if [[ "$DRY_RUN" == "yes" ]]; then
+    echo "→ DRY RUN: would curl and unzip to temp, then rsync into $MATOMO_DIR"
+    return 0
+  fi
+
+  curl -fL --retry 3 -o "$tmpd/matomo.zip" "$url"
+  unzip -q -o "$tmpd/matomo.zip" -d "$tmpd"
+  rsync -a --delete "$tmpd/matomo/" "$MATOMO_DIR/"
 }
 
 backup_config() {
-  info "$(bold "[STEP ${STEP}/7]") Backing up config.ini.php"
-  local start=$(date +%s)
-  local cfg="${MATOMO_DIR}/config/config.ini.php"
-  [[ -f "${cfg}" ]] || die "config.ini.php not found"
-  local ts="$(date +%Y-%m-%d-%H%M%S)"
-  local dest_dir="${BACKUP_DIR}"
-  local dest="${dest_dir}/config.ini.php.${ts}"
-  if [[ "${DRY_RUN}" == "yes" ]]; then
-    info "(dry-run) Would mkdir -p ${dest_dir} && cp ${cfg} ${dest}"
-  else
-    mkdir -p "${dest_dir}" || die "Cannot create backup dir: ${dest_dir}"
-    cp -a "${cfg}" "${dest}" || die "Failed to backup config"
-    ok "Backed up to ${dest}"
-  fi
-  info "Done in $(( $(date +%s) - start ))s"
-}
-
-deploy_zip() {
-  local zip="$1"
-  info "$(bold "[STEP ${STEP}/7]") Deploying files for ${PLAN_LABEL}"
-  local start=$(date +%s)
-  if [[ "${DRY_RUN}" == "yes" ]]; then
-    info "(dry-run) Would unzip and rsync into ${MATOMO_DIR}"
-  else
-    local tmpdir
-    tmpdir="$(mktemp -d)"
-    unzip -q "${zip}" -d "${tmpdir}"
-    # matomo/ directory inside archive
-    rsync -a --delete "${tmpdir}/matomo/" "${MATOMO_DIR}/"
-    rm -rf "${tmpdir}"
-    ok "Files deployed"
-  fi
-  info "Done in $(( $(date +%s) - start ))s"
+  mkdir -p "$BACKUP_DIR"
+  local ts; ts="$(date +%Y-%m-%d-%H%M%S)"
+  cp -p "$MATOMO_DIR/config/config.ini.php" "$BACKUP_DIR/config.ini.php.$ts"
+  echo "✓ Backed up to $BACKUP_DIR/config.ini.php.$ts"
 }
 
 run_core_update() {
-  info "$(bold "[STEP ${STEP}/7]") Running database migrations (core:update)"
-  local start=$(date +%s)
-  if [[ "${RUN_DB_UPDATE}" == "yes" && "${DRY_RUN}" == "no" ]]; then
-    if ! php "${MATOMO_DIR}/console" core:update -n; then
-      die "core:update failed (see output above)"
-    fi
-    ok "core:update finished"
-  else
-    warn "Skipping (run-db-update=${RUN_DB_UPDATE}, dry-run=${DRY_RUN})"
-  fi
-  info "Done in $(( $(date +%s) - start ))s"
+  run "Running database migrations (core:update)" "$MATOMO_DIR/console" core:update --yes || true
 }
 
-run_diagnostics() {
-  info "$(bold "[STEP ${STEP}/7]") Diagnostics: unexpected files"
-  local start=$(date +%s)
-  if [[ "${DIAG}" == "yes" && "${DRY_RUN}" == "no" ]]; then
-    php "${MATOMO_DIR}/console" diagnostics:unexpected-files || true
-  else
-    warn "Skipping (diagnostics=${DIAG}, dry-run=${DRY_RUN})"
-  fi
-  info "Done in $(( $(date +%s) - start ))s"
+run_unexpected_files() {
+  run "Scanning for unexpected files" "$MATOMO_DIR/console" diagnostics:unexpected-files || true
 }
 
-# ----------- interactive fill-ins -----------
-if [[ -z "${MATOMO_DIR}" ]]; then
-  # try auto-detect from PWD upwards
-  if [[ -x "./console" && -f "./config/config.ini.php" ]]; then
-    MATOMO_DIR="$(pwd)"
-  else
-    MATOMO_DIR="$(prompt "Enter Matomo directory (must contain ./console and config/config.ini.php):")"
-  fi
-fi
-while [[ -z "${MATOMO_DIR}" || ! -d "${MATOMO_DIR}" || ! is_matomo_dir "${MATOMO_DIR}" ]]; do
-  warn "Not a Matomo directory: ${MATOMO_DIR:-<empty>}"
-  MATOMO_DIR="$(prompt "Enter Matomo directory (must contain ./console and config/config.ini.php):")"
-done
-info "Using MATOMO_DIR: ${MATOMO_DIR}"
+# -------- main flow --------
+MATOMO_DIR="${MATOMO_DIR:-}"
+BACKUP_DIR="${BACKUP_DIR:-/var/backups/matomo-upgrades}"
+RUN_DB_UPDATE="${RUN_DB_UPDATE:-yes}"
+ENABLE_MAINTENANCE="${ENABLE_MAINTENANCE:-yes}"
+AUTO_INCREMENTAL="${AUTO_INCREMENTAL:-no}"
+DRY_RUN="${DRY_RUN:-no}"
+RUN_UNEXPECTED="${RUN_UNEXPECTED:-yes}"
+VERBOSE="${VERBOSE:-no}"
+OPERATION="${OPERATION:-upgrade}"    # or downgrade
+TARGET_VERSION="${TARGET_VERSION:-}"  # e.g. 5.5.1 or latest
 
-[[ -z "${BACKUP_DIR}" ]] && BACKUP_DIR="$(prompt "Backup directory [${BACKUP_DIR}]:" "${BACKUP_DIR}")"
-[[ -z "${MATOMO_USER}" ]] && MATOMO_USER="$(prompt "System user that owns/runs Matomo [${MATOMO_USER}]:" "${MATOMO_USER}")"
-[[ -z "${OPERATION}" ]] && OPERATION="$(prompt "Operation (upgrade/downgrade) [${OPERATION}]:" "${OPERATION}")"
-[[ -z "${TARGET_VERSION}" ]] && TARGET_VERSION="$(prompt "Target version (e.g. 5.5.1) or leave empty for latest:" "")"
-[[ -z "${INCREMENTAL}" ]] && INCREMENTAL="$(prompt "Auto incremental upgrade across majors? [yes/no, default ${INCREMENTAL}]:" "${INCREMENTAL}")"
-[[ -z "${RUN_DB_UPDATE}" ]] && RUN_DB_UPDATE="$(prompt "Run DB update via core:update? [yes/no, default ${RUN_DB_UPDATE}]:" "${RUN_DB_UPDATE}")"
-[[ -z "${MAINTENANCE}" ]] && MAINTENANCE="$(prompt "Enable maintenance mode during operation? [yes/no, default ${MAINTENANCE}]:" "${MAINTENANCE}")"
-[[ -z "${DRY_RUN}" ]] && DRY_RUN="$(prompt "Dry run only (show actions, no changes)? [yes/no, default ${DRY_RUN}]:" "${DRY_RUN}")"
-[[ -z "${DIAG}" ]] && DIAG="$(prompt "Run diagnostics:unexpected-files after deploy? [yes/no, default ${DIAG}]:" "${DIAG}")"
-[[ -z "${VERBOSE}" ]] && VERBOSE="$(prompt "Verbose shell output (set -x)? [yes/no, default ${VERBOSE}]:" "${VERBOSE}")"
+if [[ "${VERBOSE}" == "yes" ]]; then set -x; fi
 
-CURRENT="$(current_version || true)"
-[[ -z "${CURRENT}" ]] && warn "Could not detect current version (non-fatal)."
-info "Your current version is: ${CURRENT:-unknown}"
+prompt_matomo_dir
 
+say "Your current version is: $(current_version || echo unknown)"
+
+read -r -p "Backup directory [$BACKUP_DIR]: " ans; BACKUP_DIR="${ans:-$BACKUP_DIR}"
+read -r -p "System user that owns/runs Matomo [$(id -un)]: " ans; MATOMO_USER="${ans:-$(id -un)}"
+read -r -p "Operation (upgrade/downgrade) [upgrade]: " ans; OPERATION="${ans:-upgrade}"
+read -r -p "Target version (e.g. 5.5.1) or leave empty for latest: " ans; TARGET_VERSION="${ans:-}"
+read -r -p "Auto incremental upgrade across majors? [yes/no, default no]: " ans; AUTO_INCREMENTAL="${ans:-no}"
+read -r -p "Run DB update via core:update? [yes/no, default yes]: " ans; RUN_DB_UPDATE="${ans:-yes}"
+read -r -p "Enable maintenance mode during operation? [yes/no, default yes]: " ans; ENABLE_MAINTENANCE="${ans:-yes}"
+read -r -p "Dry run only (show actions, no changes)? [yes/no, default no]: " ans; DRY_RUN="${ans:-no}"
+read -r -p "Run diagnostics:unexpected-files after deploy? [yes/no, default yes]: " ans; RUN_UNEXPECTED="${ans:-yes}"
+read -r -p "Verbose shell output (set -x)? [yes/no, default no]: " ans; VERBOSE="${ans:-no}"
+if [[ "${VERBOSE}" == "yes" ]]; then set -x; fi
+
+CUR_VER="$(current_version || true)"
 if [[ -z "${TARGET_VERSION}" ]]; then
-  TARGET_VERSION="$(remote_latest)"
-  [[ -z "${TARGET_VERSION}" ]] && die "Could not resolve latest version."
-  info "Remote latest is: ${TARGET_VERSION}"
+  TARGET_VERSION="latest"
 fi
 
-PLAN_LABEL="${TARGET_VERSION}"
-if [[ "${TARGET_VERSION}" == "$(remote_latest)" && "${OPERATION}" == "upgrade" ]]; then
-  PLAN_LABEL="latest"
-fi
+# plan sequence
+SEQ="$(plan_sequence "${CUR_VER:-}" "${TARGET_VERSION}" "${AUTO_INCREMENTAL}")"
+say "Planned sequence: $SEQ"
 
-# Same-version protection
-if [[ -n "${CURRENT}" && "${OPERATION}" == "upgrade" && "${CURRENT}" == "${TARGET_VERSION}" ]]; then
-  if ! confirm "You are already on ${CURRENT}. Upgrade to the same version again?"; then
-    die "Aborted."
+# same-version confirmation when applicable
+if [[ "${TARGET_VERSION}" != "latest" && -n "${CUR_VER:-}" && "${CUR_VER}" == "${TARGET_VERSION}" ]]; then
+  read -r -p "You are already on ${CUR_VER}. Continue and redeploy the same version? [y/N]: " ans
+  ans="${ans:-N}"
+  if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+    die "Aborted by user."
   fi
 fi
 
 # Downgrade warning
-if [[ "${OPERATION}" == "downgrade" ]]; then
-  warn "Selected operation: DOWNGRADE (code-only). Database schema downgrades are NOT supported."
-  if ! confirm "Proceed with code-only rollback to ${TARGET_VERSION}? core:update will NOT run."; then
-    die "Aborted."
-  fi
-  RUN_DB_UPDATE="no"
+if [[ "$OPERATION" == "downgrade" ]]; then
+  echo "! Selected operation: DOWNGRADE (code-only). Database schema downgrades are not supported."
+  read -r -p "Proceed with code-only rollback to ${TARGET_VERSION}? core:update will NOT run. [y/N]: " ans
+  ans="${ans:-N}"
+  if [[ ! "$ans" =~ ^[Yy]$ ]]; then die "Aborted by user."; fi
 fi
 
-hr
-info "Planned sequence: ${PLAN_LABEL}"
-hr
+# steps count
+TOTAL_STEPS=7
+CURRENT_STEP=1
 
-# Optional incremental (naive walk across majors from CURRENT to TARGET)
-if [[ "${INCREMENTAL}" == "yes" && -n "${CURRENT}" && "${OPERATION}" == "upgrade" ]]; then
-  # For simplicity: only step across major bumps if needed (e.g., 4.x -> 5.x -> final).
-  CUR_MAJOR="${CURRENT%%.*}"
-  TGT_MAJOR="${TARGET_VERSION%%.*}"
-  if (( TGT_MAJOR > CUR_MAJOR )); then
-    info "Incremental enabled: will first upgrade to major ${CUR_MAJOR} latest, then next majors up to ${TGT_MAJOR}, then ${TARGET_VERSION}."
-    # In a real-world script you’d enumerate bridge versions here.
-  fi
+if [[ "$ENABLE_MAINTENANCE" == "yes" ]]; then
+  run "Enabling maintenance mode and pausing tracking" enable_maintenance_and_pause
+else
+  step "$CURRENT_STEP/$TOTAL_STEPS" "Skipping maintenance toggle"
 fi
+CURRENT_STEP=$((CURRENT_STEP+1))
 
-# ----------- Steps execution -----------
-STEP=1; enable_maintenance
-STEP=$((STEP+1)); backup_config
+run "Backing up config.ini.php" backup_config
+CURRENT_STEP=$((CURRENT_STEP+1))
 
-TMP_ZIP="$(mktemp -u --suffix=.zip)"
-STEP=$((STEP+1)); download_build "${PLAN_LABEL}" "${TMP_ZIP}"
+# loop through sequence
+for planned in $SEQ; do
+  CURRENT_STEP=$((CURRENT_STEP)) # keep within 3..6 block
 
-STEP=$((STEP+1)); deploy_zip "${TMP_ZIP}"
+  # resolve alias like latest_5 to real version if possible
+  RESOLVED="$(resolve_latest_alias "$planned")"
+  URL="$(zip_url_for_version "$RESOLVED")"
 
-STEP=$((STEP+1)); run_core_update
+  run "Downloading and deploying Matomo build: $planned" deploy_zip_into_matomo "$planned" "$URL"
+  CURRENT_STEP=$((CURRENT_STEP+1))
 
-STEP=$((STEP+1)); run_diagnostics
+  if [[ "$OPERATION" == "upgrade" && "$RUN_DB_UPDATE" == "yes" ]]; then
+    run "Running database migrations (core:update)" run_core_update
+  else
+    step "$CURRENT_STEP/$TOTAL_STEPS" "Skipping DB migrations"
+  fi
+  CURRENT_STEP=$((CURRENT_STEP+1))
+done
 
-STEP=$((STEP+1)); disable_maintenance
+if [[ "$RUN_UNEXPECTED" == "yes" ]]; then
+  run "Running diagnostics:unexpected-files" run_unexpected_files
+else
+  step "$CURRENT_STEP/$TOTAL_STEPS" "Skipping diagnostics:unexpected-files"
+fi
+CURRENT_STEP=$((CURRENT_STEP+1))
 
-[[ "${DRY_RUN}" == "no" ]] && rm -f "${TMP_ZIP}" || true
+if [[ "$ENABLE_MAINTENANCE" == "yes" ]]; then
+  run "Disabling maintenance mode and resuming tracking" disable_maintenance_and_resume
+else
+  step "$CURRENT_STEP/$TOTAL_STEPS" "Leaving maintenance and tracking as-is"
+fi
+CURRENT_STEP=$((CURRENT_STEP+1))
 
-ok "All done."
+say "Done. Current version now: $(current_version || echo unknown)"
+exit 0
