@@ -1,27 +1,35 @@
-cat > install.sh <<'SH'
 #!/usr/bin/env sh
 set -eu
-REPO_OWNER="elvmp"
-REPO_NAME="matomo-upgrader"
-BIN_NAME="matomo-upgrader"
-PREFIX="${PREFIX:-/usr/local}"
-BINDIR="$PREFIX/bin"
-TMPDIR="$(mktemp -d)"
-cleanup() { rm -rf "$TMPDIR"; }
-trap cleanup EXIT INT TERM
 
-echo "Downloading…"
-curl -fsSL "https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/main/$BIN_NAME" -o "$TMPDIR/$BIN_NAME"
-curl -fsSL "https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/main/$BIN_NAME.sha256" -o "$TMPDIR/$BIN_NAME.sha256"
+REPO="elvmp/matomo-upgrader"   # <-- your GitHub repo
+BIN="upgradescript"
 
-echo "Verifying…"
-( cd "$TMPDIR" && sha256sum -c "$BIN_NAME.sha256" )
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 
-echo "Installing to $BINDIR…"
-install -d "$BINDIR"
-install -m 0755 "$TMPDIR/$BIN_NAME" "$BINDIR/$BIN_NAME"
+# Pick install prefix: /usr/local/bin if writable, else ~/.local/bin
+prefix="/usr/local"
+dest="$prefix/bin/$BIN"
+if ! [ -w "$prefix/bin" ]; then
+  prefix="$HOME/.local"
+  mkdir -p "$prefix/bin"
+  dest="$prefix/bin/$BIN"
+fi
 
-echo "Done. Try: $BIN_NAME --help"
-SH
-chmod +x install.sh
-sed -i 's/\r$//' install.sh
+echo "-> Downloading $BIN ..."
+curl -fsSL "https://raw.githubusercontent.com/$REPO/main/$BIN" -o "$tmp/$BIN"
+
+# If you keep a checksum file, verify it; ignore if missing.
+if curl -fsSL "https://raw.githubusercontent.com/$REPO/main/${BIN}.sha256" -o "$tmp/${BIN}.sha256"; then
+  (cd "$tmp" && sha256sum -c "${BIN}.sha256")
+fi
+
+echo "-> Installing to $dest ..."
+install -m 0755 "$tmp/$BIN" "$dest"
+
+echo "Installed: $dest"
+case ":$PATH:" in
+  *":$prefix/bin:"*) ;;
+  *) echo "Add to PATH and re-open your shell:"
+     echo "    export PATH=\"$prefix/bin:\$PATH\""
+     ;;
+esac
